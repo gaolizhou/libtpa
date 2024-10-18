@@ -168,6 +168,11 @@ void run_client(uint16_t port, const char *ip_address) {
     for(i = 0; i < DATA_SIZE; i++) {
         send_data_page[i] = i;
     }
+    if (tpa_extmem_register(send_data_page, DATA_SIZE, NULL, 1, DATA_SIZE) != 0) {
+        fprintf(stderr, "failed to register external memory: %s\n", strerror(errno));
+        exit(1);
+    }
+
     uint8_t *recv_data_page = mmap(NULL, DATA_SIZE, PROT_READ | PROT_WRITE,
                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | (30 << 26), -1, 0);
     if (recv_data_page == MAP_FAILED) {
@@ -213,7 +218,8 @@ void run_client(uint16_t port, const char *ip_address) {
                 struct tpa_iovec *iov = pool_dequeue(&pool);
                 uint8_t *send_ptr = send_data_page + send_offset;
                 iov->iov_len = DATA_SIZE - send_offset > BUF_SIZE ? BUF_SIZE : DATA_SIZE - send_offset;
-                memcpy(iov->iov_base, send_ptr, iov->iov_len);
+                //memcpy(iov->iov_base, send_ptr, iov->iov_len);
+                iov->iov_base = send_ptr;
                 send_offset += iov->iov_len;
                 if (send_offset == DATA_SIZE) {
                     send_offset = 0;
