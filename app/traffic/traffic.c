@@ -8,7 +8,7 @@
 
 static struct tpa_worker *worker;
 
-
+#define CONN_CNT 2
 #define POOL_SIZE 128
 
 typedef struct {
@@ -73,7 +73,7 @@ static void *zwrite_extbuf_alloc(size_t size)
 
 void run_server(uint16_t port)
 {
-    int sid[10];
+    int sid[CONN_CNT];
     int sid_cnt = 0;
     int i;
 
@@ -104,7 +104,12 @@ void run_server(uint16_t port)
                 return;
             }
             //printf("DATA:%s", (char*)iov.iov_base);
-            iov.iov_read_done(iov.iov_base, iov.iov_param);
+            //iov.iov_read_done(iov.iov_base, iov.iov_param);
+            ret = tpa_zwritev(sid[i], &iov, 1);
+            if (ret != iov.iov_len) {
+                printf("failed to catch up the read; terminating ret=%ld, len=%ld, conn %d\n", ret, iov.iov_len, sid[i]);
+                iov.iov_read_done(iov.iov_base, iov.iov_param);
+            }
         }
     }
 }
@@ -115,11 +120,10 @@ static void zero_copy_write_done(void *iov_base, void *iov_param)
     pool_enqueue(&pool, iov_param);
 }
 
-#define CLIENT_CNT 5
 void run_client(uint16_t port, const char *ip_address) {
-    int sid[CLIENT_CNT], i;
+    int sid[CONN_CNT], i;
     printf(":: connecting to %s:%hu ...\n", ip_address, port);
-    for (i = 0; i < CLIENT_CNT; i++) {
+    for (i = 0; i < CONN_CNT; i++) {
         sid[i] = tpa_connect_to(ip_address, port, NULL);
         if (sid[i] < 0) {
             fprintf(stderr, "failed to connect: %s\n", strerror(errno));
@@ -146,10 +150,29 @@ void run_client(uint16_t port, const char *ip_address) {
         tpa_worker_run(worker);
         while (pool.count > 0) {
             struct tpa_iovec *iov = pool_dequeue(&pool);
-            ret = tpa_zwritev(sid[i%CLIENT_CNT], iov, 1);
+            ret = tpa_zwritev(sid[i%CONN_CNT], iov, 1);
             if (ret < 0)
                 iov->iov_write_done(iov->iov_base, iov);
         }
+
+        for (i = 0; i < CONN_CNT; i++) {
+            struct tpa_iovec iov;
+            ssize_t ret;
+
+            ret = tpa_zreadv(sid[i], &iov, 1);
+            if (ret <= 0) {
+                if (ret < 0 && errno == EAGAIN) {
+                    continue;
+                }
+                tpa_close(sid[i]);
+                printf("shutdown conn!\n");
+                return;
+            }
+            //printf("DATA:%s", (char*)iov.iov_base);
+            iov.iov_read_done(iov.iov_base, iov.iov_param);
+        }
+
+
     }
 }
 
