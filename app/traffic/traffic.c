@@ -10,6 +10,7 @@ static struct tpa_worker *worker;
 
 #define CONN_CNT 2
 #define POOL_SIZE 128
+int both_dir = 0;
 
 typedef struct {
     void *data[POOL_SIZE];
@@ -104,11 +105,14 @@ void run_server(uint16_t port)
                 return;
             }
             //printf("DATA:%s", (char*)iov.iov_base);
-            //iov.iov_read_done(iov.iov_base, iov.iov_param);
-            ret = tpa_zwritev(sid[i], &iov, 1);
-            if (ret != iov.iov_len) {
-                printf("failed to catch up the read; terminating ret=%ld, len=%ld, conn %d\n", ret, iov.iov_len, sid[i]);
+            if (!both_dir) {
                 iov.iov_read_done(iov.iov_base, iov.iov_param);
+            } else {
+                ret = tpa_zwritev(sid[i], &iov, 1);
+                if (ret != iov.iov_len) {
+                    printf("failed to catch up the read; terminating ret=%ld, len=%ld, conn %d\n", ret, iov.iov_len, sid[i]);
+                    iov.iov_read_done(iov.iov_base, iov.iov_param);
+                }
             }
         }
     }
@@ -155,31 +159,31 @@ void run_client(uint16_t port, const char *ip_address) {
                 iov->iov_write_done(iov->iov_base, iov);
         }
 
-        for (i = 0; i < CONN_CNT; i++) {
-            struct tpa_iovec iov;
-            ssize_t ret;
+        if(both_dir) {
+            for (i = 0; i < CONN_CNT; i++) {
+                struct tpa_iovec iov;
+                ssize_t ret;
 
-            ret = tpa_zreadv(sid[i], &iov, 1);
-            if (ret <= 0) {
-                if (ret < 0 && errno == EAGAIN) {
-                    continue;
+                ret = tpa_zreadv(sid[i], &iov, 1);
+                if (ret <= 0) {
+                    if (ret < 0 && errno == EAGAIN) {
+                        continue;
+                    }
+                    tpa_close(sid[i]);
+                    printf("shutdown conn!\n");
+                    return;
                 }
-                tpa_close(sid[i]);
-                printf("shutdown conn!\n");
-                return;
+                //printf("DATA:%s", (char*)iov.iov_base);
+                iov.iov_read_done(iov.iov_base, iov.iov_param);
             }
-            //printf("DATA:%s", (char*)iov.iov_base);
-            iov.iov_read_done(iov.iov_base, iov.iov_param);
         }
-
-
     }
 }
 
 int main(int argc, char **argv)
 {
-    uint16_t port = 5678;
-    if (tpa_init(2) < 0) {
+    uint16_t port;
+    if (tpa_init(1) < 0) {
         perror("tpa_init");
         return -1;
     }
@@ -188,11 +192,18 @@ int main(int argc, char **argv)
         fprintf(stderr, "failed to init worker: %s\n", strerror(errno));
         return -1;
     }
+    if (argc < 2) {
+        printf("Usage:\n");
+        printf("  %s <port>     # Run in server mode\n", argv[0]);
+        printf("  %s <port> <server_ip> # Run in client mode, connecting to server_ip\n", argv[0]);
+        return 1;
+    }
+    port = atoi(argv[1]);
 
-    if (argc == 1) {
+    if (argc == 2) {
         run_server(port);
-    } else if (argc == 2) {
-        const char *ip_address = argv[1];
+    } else if (argc == 3) {
+        const char *ip_address = argv[2];
         run_client(port, ip_address);
     } else {
         printf("Usage:\n");
