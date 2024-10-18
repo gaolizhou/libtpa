@@ -7,10 +7,9 @@
 #include <tpa.h>
 
 static struct tpa_worker *worker;
+#define POOL_SIZE 64
 
-#define CONN_CNT 2
-#define POOL_SIZE 128
-int both_dir = 0;
+int both_dir = 1;
 
 typedef struct {
     void *data[POOL_SIZE];
@@ -56,16 +55,12 @@ void pool_free(MemoryPool *pool) {
 #define EXTBUF_SIZE             (1*PAGE_SIZE)
 static void *zwrite_extbuf_alloc(size_t size)
 {
-    static void *buf;
+    void *buf = aligned_alloc(PAGE_SIZE, EXTBUF_SIZE);
+    assert(buf != NULL);
 
-    if (!buf) {
-        buf = aligned_alloc(PAGE_SIZE, EXTBUF_SIZE);
-        assert(buf != NULL);
-
-        if (tpa_extmem_register(buf, EXTBUF_SIZE, NULL, EXTBUF_SIZE / PAGE_SIZE, PAGE_SIZE) != 0) {
-            fprintf(stderr, "failed to register external memory: %s\n", strerror(errno));
-            exit(1);
-        }
+    if (tpa_extmem_register(buf, EXTBUF_SIZE, NULL, EXTBUF_SIZE / PAGE_SIZE, PAGE_SIZE) != 0) {
+        fprintf(stderr, "failed to register external memory: %s\n", strerror(errno));
+        exit(1);
     }
     assert(size <= EXTBUF_SIZE);
     return buf;
@@ -74,46 +69,43 @@ static void *zwrite_extbuf_alloc(size_t size)
 
 void run_server(uint16_t port)
 {
-    int sid[CONN_CNT];
-    int sid_cnt = 0;
-    int i;
-
+    int sid;
     printf(":: listening on port %hu ...\n", port);
     if (tpa_listen_on(NULL, port, NULL) < 0) {
         fprintf(stderr, "failed to listen on port %hu: %s\n",
                 port, strerror(errno));
         exit(1);
     }
+    while (1) {
+        tpa_worker_run(worker);
+        if (tpa_accept_burst(worker, &sid, 1) == 1) {
+            printf("Get connection\n");
+            break;
+        }
+    }
 
     while (1) {
         tpa_worker_run(worker);
-        if (tpa_accept_burst(worker, &sid[sid_cnt], 1) == 1) {
-            printf("Get connection\n");
-            sid_cnt++;
-        }
-        for (i = 0; i < sid_cnt; i++) {
-            struct tpa_iovec iov;
-            ssize_t ret;
+        struct tpa_iovec iov;
+        ssize_t ret;
 
-            ret = tpa_zreadv(sid[i], &iov, 1);
-            if (ret <= 0) {
-                if (ret < 0 && errno == EAGAIN) {
-                    continue;
-                }
-                tpa_close(sid[i]);
-                printf("shutdown conn!\n");
-                return;
+        ret = tpa_zreadv(sid, &iov, 1);
+        if (ret <= 0) {
+            if (ret < 0 && errno == EAGAIN) {
+                continue;
             }
-            //printf("DATA:%s", (char*)iov.iov_base);
-            if (!both_dir) {
+            tpa_close(sid);
+            printf("shutdown conn!\n");
+            return;
+        }
+
+        //iov.iov_read_done(iov.iov_base, iov.iov_param);
+        if (both_dir) {
+            ret = tpa_zwritev(sid, &iov, 1);
+            if (ret < 0)
                 iov.iov_read_done(iov.iov_base, iov.iov_param);
-            } else {
-                ret = tpa_zwritev(sid[i], &iov, 1);
-                if (ret != iov.iov_len) {
-                    printf("failed to catch up the read; terminating ret=%ld, len=%ld, conn %d\n", ret, iov.iov_len, sid[i]);
-                    iov.iov_read_done(iov.iov_base, iov.iov_param);
-                }
-            }
+        } else {
+            iov.iov_read_done(iov.iov_base, iov.iov_param);
         }
     }
 }
@@ -125,22 +117,20 @@ static void zero_copy_write_done(void *iov_base, void *iov_param)
 }
 
 void run_client(uint16_t port, const char *ip_address) {
-    int sid[CONN_CNT], i;
+    int sid, i;
     printf(":: connecting to %s:%hu ...\n", ip_address, port);
-    for (i = 0; i < CONN_CNT; i++) {
-        sid[i] = tpa_connect_to(ip_address, port, NULL);
-        if (sid[i] < 0) {
-            fprintf(stderr, "failed to connect: %s\n", strerror(errno));
-            return;
-        }
+    sid = tpa_connect_to(ip_address, port, NULL);
+    if (sid < 0) {
+        fprintf(stderr, "failed to connect: %s\n", strerror(errno));
+        return;
     }
     for(i=0;i<1000;i++) {
         tpa_worker_run(worker);
     }
     pool_init(&pool);
-    struct tpa_iovec iov[128];
+    struct tpa_iovec iov[POOL_SIZE];
     int ret;
-    for (i = 0; i < 128; i++) {
+    for (i = 0; i < POOL_SIZE; i++) {
         iov[i].iov_base = zwrite_extbuf_alloc(4096);
         iov[i].iov_phys = 1;
         iov[i].iov_param = &iov[i];
@@ -150,30 +140,23 @@ void run_client(uint16_t port, const char *ip_address) {
     }
 
     while (1) {
-        i++;
         tpa_worker_run(worker);
         while (pool.count > 0) {
             struct tpa_iovec *iov = pool_dequeue(&pool);
-            ret = tpa_zwritev(sid[i%CONN_CNT], iov, 1);
+            ret = tpa_zwritev(sid, iov, 1);
             if (ret < 0)
                 iov->iov_write_done(iov->iov_base, iov);
-        }
-
-        if(both_dir) {
-            for (i = 0; i < CONN_CNT; i++) {
+            if (both_dir) {
                 struct tpa_iovec iov;
-                ssize_t ret;
-
-                ret = tpa_zreadv(sid[i], &iov, 1);
+                ret = tpa_zreadv(sid, &iov, 1);
                 if (ret <= 0) {
                     if (ret < 0 && errno == EAGAIN) {
                         continue;
                     }
-                    tpa_close(sid[i]);
+                    tpa_close(sid);
                     printf("shutdown conn!\n");
                     return;
                 }
-                //printf("DATA:%s", (char*)iov.iov_base);
                 iov.iov_read_done(iov.iov_base, iov.iov_param);
             }
         }
