@@ -5,9 +5,13 @@
 #include <stdbool.h>
 #include <string.h>
 #include <tpa.h>
+#include <time.h>
+
 
 static struct tpa_worker *worker;
 #define POOL_SIZE 64
+static uint64_t tx_bytes = 0;
+static uint64_t rx_bytes = 0;
 
 int both_dir = 1;
 
@@ -84,7 +88,22 @@ void run_server(uint16_t port)
         }
     }
 
+    struct timespec start_time, current_time;
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
     while (1) {
+        clock_gettime(CLOCK_MONOTONIC, &current_time);
+        double elapsed = (current_time.tv_sec - start_time.tv_sec) * 1000 +
+                         (current_time.tv_nsec - start_time.tv_nsec) / 1e6;
+        if (elapsed >= 1000) {
+            double send_rate = (double)tx_bytes / elapsed * 1000 / (1024.0 * 1024.0 * 1024.0);
+            double receive_rate = (double)rx_bytes / elapsed * 1000 / (1024.0 * 1024.0 * 1024.0);
+
+            printf("tx: %.2f GB/s, rx: %.2f GB\n", send_rate, receive_rate);
+            start_time = current_time;
+            tx_bytes = 0;
+            rx_bytes = 0;
+        }
+
         tpa_worker_run(worker);
         struct tpa_iovec iov;
         ssize_t ret;
@@ -98,12 +117,14 @@ void run_server(uint16_t port)
             printf("shutdown conn!\n");
             return;
         }
+        rx_bytes += iov.iov_len;
 
         //iov.iov_read_done(iov.iov_base, iov.iov_param);
         if (both_dir) {
             ret = tpa_zwritev(sid, &iov, 1);
             if (ret < 0)
                 iov.iov_read_done(iov.iov_base, iov.iov_param);
+            tx_bytes += iov.iov_len;
         } else {
             iov.iov_read_done(iov.iov_base, iov.iov_param);
         }
@@ -139,13 +160,29 @@ void run_client(uint16_t port, const char *ip_address) {
         pool_enqueue(&pool, &iov[i]);
     }
 
+    struct timespec start_time, current_time;
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
+
     while (1) {
+        clock_gettime(CLOCK_MONOTONIC, &current_time);
+        double elapsed = (current_time.tv_sec - start_time.tv_sec) *1000+
+                         (current_time.tv_nsec - start_time.tv_nsec) / 1e6;
+        if (elapsed >= 1000) {
+            double send_rate = (double)tx_bytes / elapsed * 1000 / (1024.0 * 1024.0 * 1024.0);
+            double receive_rate = (double)rx_bytes / elapsed * 1000 / (1024.0 * 1024.0 * 1024.0);
+
+            printf("tx: %.2f GB/s, rx: %.2f GB/s\n", send_rate, receive_rate);
+            start_time = current_time;
+            tx_bytes = 0;
+            rx_bytes = 0;
+        }
         tpa_worker_run(worker);
         while (pool.count > 0) {
             struct tpa_iovec *iov = pool_dequeue(&pool);
             ret = tpa_zwritev(sid, iov, 1);
             if (ret < 0)
                 iov->iov_write_done(iov->iov_base, iov);
+            tx_bytes += iov->iov_len;
             if (both_dir) {
                 struct tpa_iovec iov;
                 ret = tpa_zreadv(sid, &iov, 1);
@@ -157,6 +194,7 @@ void run_client(uint16_t port, const char *ip_address) {
                     printf("shutdown conn!\n");
                     return;
                 }
+                rx_bytes += iov.iov_len;
                 iov.iov_read_done(iov.iov_base, iov.iov_param);
             }
         }
