@@ -19,8 +19,6 @@
 static uint64_t tx_bytes = 0;
 static uint64_t rx_bytes = 0;
 
-int both_dir = 1;
-
 typedef struct {
     void *data[POOL_SIZE];
     int head;
@@ -144,16 +142,11 @@ void run_server(uint16_t port)
         rx_bytes += iov.iov_len;
         total_recv_bytes_left -= iov.iov_len;
 
-        //iov.iov_read_done(iov.iov_base, iov.iov_param);
-        if (both_dir) {
-            ret = tpa_zwritev(sid[1], &iov, 1);
-            if (ret < 0)
-                iov.iov_read_done(iov.iov_base, iov.iov_param);
-            tx_bytes += iov.iov_len;
-            total_send_bytes_left -= iov.iov_len;
-        } else {
+        ret = tpa_zwritev(sid[1], &iov, 1);
+        if (ret < 0)
             iov.iov_read_done(iov.iov_base, iov.iov_param);
-        }
+        tx_bytes += iov.iov_len;
+        total_send_bytes_left -= iov.iov_len;
     }
 }
 
@@ -166,16 +159,32 @@ static void zero_copy_write_done(void *iov_base, void *iov_param)
 struct ThreadArgs {
     int is_tx;
     uint64_t *total_bytes_left;
-    struct tpa_worker *worker;
     uint8_t *data_page;
-    int sid;
+    const char *server_ip;
+    uint16_t port;
+    int *start;
 };
 void *client_thread(void *arg) {
     struct ThreadArgs *thread_args = (struct ThreadArgs *)arg;
-    struct tpa_worker *worker = thread_args->worker;
+    struct tpa_worker *worker =  tpa_worker_init();
     uint64_t *total_bytes_left = thread_args->total_bytes_left;
     int sid, i;
-    sid = thread_args->sid;
+    printf(":: connecting to %s:%hu ...\n", thread_args->server_ip, thread_args->port);
+    sid = tpa_connect_to(thread_args->server_ip, thread_args->port, NULL);
+    if (sid < 0) {
+        fprintf(stderr, "failed to connect: %s\n", strerror(errno));
+        return NULL;
+    }
+    for(i=0;i<1000;i++) {
+        tpa_worker_run(worker);
+    }
+    __sync_fetch_and_add(thread_args->start, 1);
+    int loaded_value = 0;
+    while(loaded_value!=2) {
+        tpa_worker_run(worker);
+        __atomic_load(thread_args->start, &loaded_value, __ATOMIC_SEQ_CST);
+    }
+
     uint8_t *data_page = thread_args->data_page;
     if (thread_args->is_tx) {
         pool_init(&pool);
@@ -224,7 +233,7 @@ void *client_thread(void *arg) {
                 return NULL;
             }
             rx_bytes += iov.iov_len;
-            total_bytes_left -= iov.iov_len;
+            *total_bytes_left -= iov.iov_len;
             if (data_offset + iov.iov_len > DATA_SIZE) {
                 uint8_t *recv_ptr = data_page + data_offset;
                 size_t first_chunk_size = DATA_SIZE - data_offset;
@@ -254,16 +263,8 @@ void *client_thread(void *arg) {
 }
 
 void run_client(uint16_t port, const char *ip_address) {
-
-    struct tpa_worker *worker[2];
     if (tpa_init(2) < 0) {
         perror("tpa_init");
-        return;
-    }
-    worker[0] = tpa_worker_init();
-    worker[1] = tpa_worker_init();
-    if (!worker[0] || !worker[1]) {
-        fprintf(stderr, "failed to init worker: %s\n", strerror(errno));
         return;
     }
     uint8_t *send_data_page = mmap(NULL, DATA_SIZE, PROT_READ | PROT_WRITE,
@@ -288,50 +289,34 @@ void run_client(uint16_t port, const char *ip_address) {
         return;
     }
 
-    int sid[2];
-    printf(":: connecting to %s:%hu ...\n", ip_address, port);
-    sid[0] = tpa_connect_to(ip_address, port, NULL);
-    if (sid[0] < 0) {
-        fprintf(stderr, "failed to connect: %s\n", strerror(errno));
-        return;
-    }
-    for(i=0;i<1000;i++) {
-        tpa_worker_run(worker[0]);
-    }
-
-    sid[1] = tpa_connect_to(ip_address, port, NULL);
-    if (sid[1] < 0) {
-        fprintf(stderr, "failed to connect: %s\n", strerror(errno));
-        return;
-    }
-    for(i=0;i<1000;i++) {
-        tpa_worker_run(worker[1]);
-    }
-
     struct timespec start_time, current_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
     uint64_t total_send_bytes_left = TEST_ROUND * DATA_SIZE;
     uint64_t total_recv_bytes_left = TEST_ROUND * DATA_SIZE;
+    int start = 0;
     struct ThreadArgs thread_args[2] = {
             {
-                .worker = worker[0],
                 .is_tx = true,
                 .total_bytes_left = &total_send_bytes_left,
-                .sid = sid[0],
                 .data_page = send_data_page,
+                .server_ip = ip_address,
+                .port = port,
+                .start = &start,
             },
             {
-                .worker = worker[1],
                 .is_tx = false,
                 .total_bytes_left = &total_recv_bytes_left,
-                .sid = sid[1],
                 .data_page = recv_data_page,
+                .server_ip = ip_address,
+                .port = port,
+                .start = &start,
             }
     };
 
     pthread_t thread[2];
     for (i = 0; i < 2; i++) {
         pthread_create(&thread[i], NULL, client_thread, &thread_args[i]);
+        usleep(50000);
     }
     uint64_t last_total_send_bytes_left = total_send_bytes_left;
     uint64_t last_total_recv_bytes_left = total_recv_bytes_left;
@@ -349,6 +334,9 @@ void run_client(uint16_t port, const char *ip_address) {
             printf("tx: %.2f GB/s, rx: %.2f GB/s left=%ld/%ld\n",
                    send_rate, receive_rate, total_send_bytes_left, total_recv_bytes_left);
             start_time = current_time;
+            last_total_send_bytes_left = total_send_bytes_left;
+            last_total_recv_bytes_left = total_recv_bytes_left;
+
         }
     }
     for (i = 0; i < 2; i++) {
