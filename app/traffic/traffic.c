@@ -5,11 +5,12 @@
 #include <stdbool.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
+#include <pthread.h>
 #include <tpa.h>
 #include <time.h>
 
 
-static struct tpa_worker *worker;
 #define POOL_SIZE 64
 #define BUF_SIZE 4096
 #define DATA_SIZE (1<<30ULL)
@@ -78,7 +79,19 @@ static void *zwrite_extbuf_alloc(size_t size)
 
 void run_server(uint16_t port)
 {
-    int sid;
+    struct tpa_worker *worker;
+    if (tpa_init(1) < 0) {
+        perror("tpa_init");
+        return;
+    }
+    worker = tpa_worker_init();
+    if (!worker) {
+        fprintf(stderr, "failed to init worker: %s\n", strerror(errno));
+        return;
+    }
+
+    int sid[2];
+    int sid_cnt = 0;
     printf(":: listening on port %hu ...\n", port);
     if (tpa_listen_on(NULL, port, NULL) < 0) {
         fprintf(stderr, "failed to listen on port %hu: %s\n",
@@ -87,9 +100,12 @@ void run_server(uint16_t port)
     }
     while (1) {
         tpa_worker_run(worker);
-        if (tpa_accept_burst(worker, &sid, 1) == 1) {
+        if (tpa_accept_burst(worker, &sid[sid_cnt], 1) == 1) {
             printf("Get connection\n");
-            break;
+            sid_cnt++;
+            if (sid_cnt == 2) {
+                break;
+            }
         }
     }
 
@@ -116,12 +132,12 @@ void run_server(uint16_t port)
         struct tpa_iovec iov;
         ssize_t ret;
 
-        ret = tpa_zreadv(sid, &iov, 1);
+        ret = tpa_zreadv(sid[0], &iov, 1);
         if (ret <= 0) {
             if (ret < 0 && errno == EAGAIN) {
                 continue;
             }
-            tpa_close(sid);
+            tpa_close(sid[0]);
             printf("shutdown conn! %s\n", strerror(errno));
             return;
         }
@@ -130,7 +146,7 @@ void run_server(uint16_t port)
 
         //iov.iov_read_done(iov.iov_base, iov.iov_param);
         if (both_dir) {
-            ret = tpa_zwritev(sid, &iov, 1);
+            ret = tpa_zwritev(sid[1], &iov, 1);
             if (ret < 0)
                 iov.iov_read_done(iov.iov_base, iov.iov_param);
             tx_bytes += iov.iov_len;
@@ -147,24 +163,116 @@ static void zero_copy_write_done(void *iov_base, void *iov_param)
     pool_enqueue(&pool, iov_param);
 }
 
-void run_client(uint16_t port, const char *ip_address) {
+struct ThreadArgs {
+    int is_tx;
+    uint64_t *total_bytes_left;
+    struct tpa_worker *worker;
+    uint8_t *data_page;
+    int sid;
+};
+void *client_thread(void *arg) {
+    struct ThreadArgs *thread_args = (struct ThreadArgs *)arg;
+    struct tpa_worker *worker = thread_args->worker;
+    uint64_t *total_bytes_left = thread_args->total_bytes_left;
     int sid, i;
-    printf(":: connecting to %s:%hu ...\n", ip_address, port);
-    sid = tpa_connect_to(ip_address, port, NULL);
-    if (sid < 0) {
-        fprintf(stderr, "failed to connect: %s\n", strerror(errno));
+    sid = thread_args->sid;
+    uint8_t *data_page = thread_args->data_page;
+    if (thread_args->is_tx) {
+        pool_init(&pool);
+        struct tpa_iovec iov[POOL_SIZE];
+        for (i = 0; i < POOL_SIZE; i++) {
+            iov[i].iov_base = zwrite_extbuf_alloc(BUF_SIZE);
+            iov[i].iov_phys = 1;
+            iov[i].iov_param = &iov[i];
+            iov[i].iov_len = BUF_SIZE;
+            iov[i].iov_write_done = zero_copy_write_done;
+            pool_enqueue(&pool, &iov[i]);
+        }
+    }
+    uint32_t data_offset = 0;
+    while (*total_bytes_left > 0) {
+        tpa_worker_run(worker);
+        if(thread_args->is_tx) {
+            if (pool.count > 0) {
+                    struct tpa_iovec *iov = pool_dequeue(&pool);
+                    uint8_t *send_ptr = data_page + data_offset;
+                    iov->iov_len = DATA_SIZE - data_offset > BUF_SIZE ? BUF_SIZE : DATA_SIZE - data_offset;
+                    //memcpy(iov->iov_base, send_ptr, iov->iov_len);
+                    iov->iov_base = send_ptr;
+                    data_offset += iov->iov_len;
+                    if (data_offset == DATA_SIZE) {
+                        data_offset = 0;
+                    }
+                    int ret = tpa_zwritev(sid, iov, 1);
+                    if (ret < 0) {
+                        iov->iov_write_done(iov->iov_base, iov);
+                        printf("failed to write to socket: %s\n", strerror(errno));
+                        return NULL;
+                    }
+                    tx_bytes += iov->iov_len;
+                    *total_bytes_left -= iov->iov_len;
+            }
+        } else {
+            struct tpa_iovec iov;
+            int ret = tpa_zreadv(sid, &iov, 1);
+            if (ret <= 0) {
+                if (ret < 0 && errno == EAGAIN) {
+                    continue;
+                }
+                tpa_close(sid);
+                printf("shutdown conn %s\n", strerror(errno));
+                return NULL;
+            }
+            rx_bytes += iov.iov_len;
+            total_bytes_left -= iov.iov_len;
+            if (data_offset + iov.iov_len > DATA_SIZE) {
+                uint8_t *recv_ptr = data_page + data_offset;
+                size_t first_chunk_size = DATA_SIZE - data_offset;
+                memcpy(recv_ptr, iov.iov_base, first_chunk_size);
+                data_offset = 0;
+                recv_ptr = data_page + data_offset;
+                size_t second_chunk_size = iov.iov_len - first_chunk_size;
+                memcpy(recv_ptr, iov.iov_base + first_chunk_size, second_chunk_size);
+                data_offset += second_chunk_size;
+            } else {
+                uint8_t *recv_ptr = data_page + data_offset;
+                memcpy(recv_ptr, iov.iov_base, iov.iov_len);
+                data_offset += iov.iov_len;
+                if (data_offset == DATA_SIZE) {
+                    data_offset = 0;
+                }
+            }
+            iov.iov_read_done(iov.iov_base, iov.iov_param);
+        }
+    }
+    if(thread_args->is_tx) {
+        while (pool.count != POOL_SIZE) {
+            tpa_worker_run(worker);
+        }
+    }
+    return NULL;
+}
+
+void run_client(uint16_t port, const char *ip_address) {
+
+    struct tpa_worker *worker[2];
+    if (tpa_init(2) < 0) {
+        perror("tpa_init");
         return;
     }
-    for(i=0;i<1000;i++) {
-        tpa_worker_run(worker);
+    worker[0] = tpa_worker_init();
+    worker[1] = tpa_worker_init();
+    if (!worker[0] || !worker[1]) {
+        fprintf(stderr, "failed to init worker: %s\n", strerror(errno));
+        return;
     }
-    pool_init(&pool);
     uint8_t *send_data_page = mmap(NULL, DATA_SIZE, PROT_READ | PROT_WRITE,
-                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | (30 << 26), -1, 0);
+                                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | (30 << 26), -1, 0);
     if (send_data_page == MAP_FAILED) {
         perror("mmap send_data_page");
         return;
     }
+    int i;
     for(i = 0; i < DATA_SIZE; i++) {
         send_data_page[i] = i;
     }
@@ -174,101 +282,77 @@ void run_client(uint16_t port, const char *ip_address) {
     }
 
     uint8_t *recv_data_page = mmap(NULL, DATA_SIZE, PROT_READ | PROT_WRITE,
-                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | (30 << 26), -1, 0);
+                                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | (30 << 26), -1, 0);
     if (recv_data_page == MAP_FAILED) {
         perror("mmap recv_data_page");
         return;
     }
 
-    struct tpa_iovec iov[POOL_SIZE];
-    int ret;
-    for (i = 0; i < POOL_SIZE; i++) {
-        iov[i].iov_base = zwrite_extbuf_alloc(BUF_SIZE);
-        iov[i].iov_phys = 1;
-        iov[i].iov_param = &iov[i];
-        iov[i].iov_len = BUF_SIZE;
-        iov[i].iov_write_done = zero_copy_write_done;
-        pool_enqueue(&pool, &iov[i]);
+    int sid[2];
+    printf(":: connecting to %s:%hu ...\n", ip_address, port);
+    sid[0] = tpa_connect_to(ip_address, port, NULL);
+    if (sid[0] < 0) {
+        fprintf(stderr, "failed to connect: %s\n", strerror(errno));
+        return;
+    }
+    for(i=0;i<1000;i++) {
+        tpa_worker_run(worker[0]);
+    }
+
+    sid[1] = tpa_connect_to(ip_address, port, NULL);
+    if (sid[1] < 0) {
+        fprintf(stderr, "failed to connect: %s\n", strerror(errno));
+        return;
+    }
+    for(i=0;i<1000;i++) {
+        tpa_worker_run(worker[1]);
     }
 
     struct timespec start_time, current_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
-    uint32_t send_offset = 0;
-    uint32_t recv_offset = 0;
-    uint64_t total_send_bytes_left = TEST_ROUND * DATA_SIZE;;
-    uint64_t total_recv_bytes_left = TEST_ROUND * DATA_SIZE;;
+    uint64_t total_send_bytes_left = TEST_ROUND * DATA_SIZE;
+    uint64_t total_recv_bytes_left = TEST_ROUND * DATA_SIZE;
+    struct ThreadArgs thread_args[2] = {
+            {
+                .worker = worker[0],
+                .is_tx = true,
+                .total_bytes_left = &total_send_bytes_left,
+                .sid = sid[0],
+                .data_page = send_data_page,
+            },
+            {
+                .worker = worker[1],
+                .is_tx = false,
+                .total_bytes_left = &total_recv_bytes_left,
+                .sid = sid[1],
+                .data_page = recv_data_page,
+            }
+    };
+
+    pthread_t thread[2];
+    for (i = 0; i < 2; i++) {
+        pthread_create(&thread[i], NULL, client_thread, &thread_args[i]);
+    }
+    uint64_t last_total_send_bytes_left = total_send_bytes_left;
+    uint64_t last_total_recv_bytes_left = total_recv_bytes_left;
 
     while (total_send_bytes_left > 0 || total_recv_bytes_left > 0) {
         clock_gettime(CLOCK_MONOTONIC, &current_time);
-        double elapsed = (current_time.tv_sec - start_time.tv_sec) *1000+
+        double elapsed = (current_time.tv_sec - start_time.tv_sec) * 1000 +
                          (current_time.tv_nsec - start_time.tv_nsec) / 1e6;
         if (elapsed >= 1000) {
-            double send_rate = (double)tx_bytes / elapsed * 1000 / (1024.0 * 1024.0 * 1024.0);
-            double receive_rate = (double)rx_bytes / elapsed * 1000 / (1024.0 * 1024.0 * 1024.0);
+            double send_rate = (double) (last_total_send_bytes_left - total_send_bytes_left) / elapsed * 1000 /
+                               (1024.0 * 1024.0 * 1024.0);
+            double receive_rate = (double) (last_total_recv_bytes_left - total_recv_bytes_left) / elapsed * 1000 /
+                                  (1024.0 * 1024.0 * 1024.0);
 
             printf("tx: %.2f GB/s, rx: %.2f GB/s left=%ld/%ld\n",
                    send_rate, receive_rate, total_send_bytes_left, total_recv_bytes_left);
             start_time = current_time;
-            tx_bytes = 0;
-            rx_bytes = 0;
-        }
-        tpa_worker_run(worker);
-        if (pool.count > 0) {
-            if (total_send_bytes_left > 0) {
-                struct tpa_iovec *iov = pool_dequeue(&pool);
-                uint8_t *send_ptr = send_data_page + send_offset;
-                iov->iov_len = DATA_SIZE - send_offset > BUF_SIZE ? BUF_SIZE : DATA_SIZE - send_offset;
-                //memcpy(iov->iov_base, send_ptr, iov->iov_len);
-                iov->iov_base = send_ptr;
-                send_offset += iov->iov_len;
-                if (send_offset == DATA_SIZE) {
-                    send_offset = 0;
-                }
-                ret = tpa_zwritev(sid, iov, 1);
-                if (ret < 0) {
-                    iov->iov_write_done(iov->iov_base, iov);
-                    printf("failed to write to socket: %s\n", strerror(errno));
-                    return;
-                }
-                tx_bytes += iov->iov_len;
-                total_send_bytes_left -= iov->iov_len;
-            }
-            if (both_dir && total_recv_bytes_left > 0) {
-                struct tpa_iovec iov;
-                ret = tpa_zreadv(sid, &iov, 1);
-                if (ret <= 0) {
-                    if (ret < 0 && errno == EAGAIN) {
-                        continue;
-                    }
-                    tpa_close(sid);
-                    printf("shutdown conn %s\n", strerror(errno));
-                    return;
-                }
-                rx_bytes += iov.iov_len;
-                total_recv_bytes_left -= iov.iov_len;
-                if (recv_offset + iov.iov_len > DATA_SIZE) {
-                    uint8_t *recv_ptr = recv_data_page + recv_offset;
-                    size_t first_chunk_size = DATA_SIZE - recv_offset;
-                    memcpy(recv_ptr, iov.iov_base, first_chunk_size);
-                    recv_offset = 0;
-                    recv_ptr = recv_data_page + recv_offset;
-                    size_t second_chunk_size = iov.iov_len - first_chunk_size;
-                    memcpy(recv_ptr, iov.iov_base + first_chunk_size, second_chunk_size);
-                    recv_offset += second_chunk_size;
-                } else {
-                    uint8_t *recv_ptr = recv_data_page + recv_offset;
-                    memcpy(recv_ptr, iov.iov_base, iov.iov_len);
-                    recv_offset += iov.iov_len;
-                    if (recv_offset == DATA_SIZE) {
-                        recv_offset = 0;
-                    }
-                }
-                iov.iov_read_done(iov.iov_base, iov.iov_param);
-            }
         }
     }
-    while(pool.count != POOL_SIZE) {
-        tpa_worker_run(worker);
+    for (i = 0; i < 2; i++) {
+        pthread_join(thread[i], NULL);
     }
     printf("Done left=%lu/%lu\n",  total_send_bytes_left, total_recv_bytes_left);
     int res = memcmp(send_data_page, recv_data_page, DATA_SIZE);
@@ -282,15 +366,6 @@ void run_client(uint16_t port, const char *ip_address) {
 int main(int argc, char **argv)
 {
     uint16_t port;
-    if (tpa_init(1) < 0) {
-        perror("tpa_init");
-        return -1;
-    }
-    worker = tpa_worker_init();
-    if (!worker) {
-        fprintf(stderr, "failed to init worker: %s\n", strerror(errno));
-        return -1;
-    }
     if (argc < 2) {
         printf("Usage:\n");
         printf("  %s <port>     # Run in server mode\n", argv[0]);
