@@ -12,7 +12,7 @@
 
 static struct tpa_worker *worker;
 #define POOL_SIZE 64
-#define BUF_SIZE 8192
+#define BUF_SIZE 16384
 #define DATA_SIZE (1<<30ULL)
 #define TEST_ROUND (7*20ULL)
 
@@ -220,30 +220,26 @@ void run_client(uint16_t port, const char *ip_address) {
         }
         tpa_worker_run(worker);
         while (pool.count > 0 && total_send_bytes_left > 0) {
-            tpa_worker_run(worker);
-            if (total_send_bytes_left > 0) {
-                struct tpa_iovec *iov = pool_dequeue(&pool);
-                uint8_t *send_ptr = send_data_page + send_offset;
-                iov->iov_len = DATA_SIZE - send_offset > BUF_SIZE ? BUF_SIZE : DATA_SIZE - send_offset;
-                //memcpy(iov->iov_base, send_ptr, iov->iov_len);
-                iov->iov_base = send_ptr;
-                send_offset += iov->iov_len;
-                if (send_offset == DATA_SIZE) {
-                    send_offset = 0;
-                }
-                ret = tpa_zwritev(sid, iov, 1);
-                if (ret < 0) {
-                    iov->iov_write_done(iov->iov_base, iov);
-                    printf("failed to write to socket: %s\n", strerror(errno));
-                    return;
-                }
-                tx_bytes += iov->iov_len;
-                total_send_bytes_left -= iov->iov_len;
+            struct tpa_iovec *iov = pool_dequeue(&pool);
+            uint8_t *send_ptr = send_data_page + send_offset;
+            iov->iov_len = DATA_SIZE - send_offset > BUF_SIZE ? BUF_SIZE : DATA_SIZE - send_offset;
+            //memcpy(iov->iov_base, send_ptr, iov->iov_len);
+            iov->iov_base = send_ptr;
+            send_offset += iov->iov_len;
+            if (send_offset == DATA_SIZE) {
+                send_offset = 0;
             }
+            ret = tpa_zwritev(sid, iov, 1);
+            if (ret < 0) {
+                iov->iov_write_done(iov->iov_base, iov);
+                printf("failed to write to socket: %s\n", strerror(errno));
+                return;
+            }
+            tx_bytes += iov->iov_len;
+            total_send_bytes_left -= iov->iov_len;
         }
 
         while (total_recv_bytes_left > 0) {
-            tpa_worker_run(worker);
             struct tpa_iovec iov;
             ret = tpa_zreadv(sid, &iov, 1);
             if (ret <= 0) {
