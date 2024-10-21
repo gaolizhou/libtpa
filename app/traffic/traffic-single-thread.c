@@ -7,12 +7,12 @@
 #include <sys/mman.h>
 #include <tpa.h>
 #include <time.h>
-#include <rte_memcpy.h>
+//#include <rte_memcpy.h>
 
 
 static struct tpa_worker *worker;
 #define POOL_SIZE 64
-#define BUF_SIZE 4096
+#define BUF_SIZE 8192
 #define DATA_SIZE (1<<30ULL)
 #define TEST_ROUND (7*20ULL)
 
@@ -63,6 +63,7 @@ void pool_free(MemoryPool *pool) {
 #define BUF_TYPE_EXTERNAL       ((void *)(uintptr_t)2)
 #define PAGE_SIZE               4096
 #define EXTBUF_SIZE             (1*PAGE_SIZE)
+/*
 static void *zwrite_extbuf_alloc(size_t size)
 {
     void *buf = aligned_alloc(PAGE_SIZE, EXTBUF_SIZE);
@@ -75,7 +76,7 @@ static void *zwrite_extbuf_alloc(size_t size)
     assert(size <= EXTBUF_SIZE);
     return buf;
 }
-
+*/
 
 void run_server(uint16_t port)
 {
@@ -99,18 +100,22 @@ void run_server(uint16_t port)
     uint64_t total_send_bytes_left = TEST_ROUND * DATA_SIZE;;
     uint64_t total_recv_bytes_left = TEST_ROUND * DATA_SIZE;;
 
+    uint64_t cnt = 0;
     while (1) {
-        clock_gettime(CLOCK_MONOTONIC, &current_time);
-        double elapsed = (current_time.tv_sec - start_time.tv_sec) * 1000 +
-                         (current_time.tv_nsec - start_time.tv_nsec) / 1e6;
-        if (elapsed >= 1000) {
-            double send_rate = (double)tx_bytes / elapsed * 1000 / (1024.0 * 1024.0 * 1024.0);
-            double receive_rate = (double)rx_bytes / elapsed * 1000 / (1024.0 * 1024.0 * 1024.0);
+        cnt++;
+        if(cnt % 10000==0) {
+            clock_gettime(CLOCK_MONOTONIC, &current_time);
+            double elapsed = (current_time.tv_sec - start_time.tv_sec) * 1000 +
+                             (current_time.tv_nsec - start_time.tv_nsec) / 1e6;
+            if (elapsed >= 1000) {
+                double send_rate = (double) tx_bytes / elapsed * 1000 / (1024.0 * 1024.0 * 1024.0);
+                double receive_rate = (double) rx_bytes / elapsed * 1000 / (1024.0 * 1024.0 * 1024.0);
 
-            printf("tx: %.2f GB/s, rx: %.2f GB\n", send_rate, receive_rate);
-            start_time = current_time;
-            tx_bytes = 0;
-            rx_bytes = 0;
+                printf("tx: %.2f GB/s, rx: %.2f GB\n", send_rate, receive_rate);
+                start_time = current_time;
+                tx_bytes = 0;
+                rx_bytes = 0;
+            }
         }
 
         tpa_worker_run(worker);
@@ -129,16 +134,11 @@ void run_server(uint16_t port)
         rx_bytes += iov.iov_len;
         total_recv_bytes_left -= iov.iov_len;
 
-        //iov.iov_read_done(iov.iov_base, iov.iov_param);
-        if (both_dir) {
-            ret = tpa_zwritev(sid, &iov, 1);
-            if (ret < 0)
-                iov.iov_read_done(iov.iov_base, iov.iov_param);
-            tx_bytes += iov.iov_len;
-            total_send_bytes_left -= iov.iov_len;
-        } else {
+        ret = tpa_zwritev(sid, &iov, 1);
+        if (ret < 0)
             iov.iov_read_done(iov.iov_base, iov.iov_param);
-        }
+        tx_bytes += iov.iov_len;
+        total_send_bytes_left -= iov.iov_len;
     }
 }
 
@@ -184,7 +184,8 @@ void run_client(uint16_t port, const char *ip_address) {
     struct tpa_iovec iov[POOL_SIZE];
     int ret;
     for (i = 0; i < POOL_SIZE; i++) {
-        iov[i].iov_base = zwrite_extbuf_alloc(BUF_SIZE);
+        //iov[i].iov_base = zwrite_extbuf_alloc(BUF_SIZE);
+        iov[i].iov_base = NULL;
         iov[i].iov_phys = 1;
         iov[i].iov_param = &iov[i];
         iov[i].iov_len = BUF_SIZE;
@@ -199,22 +200,27 @@ void run_client(uint16_t port, const char *ip_address) {
     uint64_t total_send_bytes_left = TEST_ROUND * DATA_SIZE;;
     uint64_t total_recv_bytes_left = TEST_ROUND * DATA_SIZE;;
 
+    uint64_t cnt = 0;
     while (total_send_bytes_left > 0 || total_recv_bytes_left > 0) {
-        clock_gettime(CLOCK_MONOTONIC, &current_time);
-        double elapsed = (current_time.tv_sec - start_time.tv_sec) *1000+
-                         (current_time.tv_nsec - start_time.tv_nsec) / 1e6;
-        if (elapsed >= 1000) {
-            double send_rate = (double)tx_bytes / elapsed * 1000 / (1024.0 * 1024.0 * 1024.0);
-            double receive_rate = (double)rx_bytes / elapsed * 1000 / (1024.0 * 1024.0 * 1024.0);
+        cnt++;
+        if(cnt % 10000==0) {
+            clock_gettime(CLOCK_MONOTONIC, &current_time);
+            double elapsed = (current_time.tv_sec - start_time.tv_sec) *1000+
+                             (current_time.tv_nsec - start_time.tv_nsec) / 1e6;
+            if (elapsed >= 1000) {
+                double send_rate = (double)tx_bytes / elapsed * 1000 / (1024.0 * 1024.0 * 1024.0);
+                double receive_rate = (double)rx_bytes / elapsed * 1000 / (1024.0 * 1024.0 * 1024.0);
 
-            printf("tx: %.2f GB/s, rx: %.2f GB/s left=%ld/%ld\n",
-                   send_rate, receive_rate, total_send_bytes_left, total_recv_bytes_left);
-            start_time = current_time;
-            tx_bytes = 0;
-            rx_bytes = 0;
+                printf("tx: %.2f GB/s, rx: %.2f GB/s left=%ld/%ld\n",
+                       send_rate, receive_rate, total_send_bytes_left, total_recv_bytes_left);
+                start_time = current_time;
+                tx_bytes = 0;
+                rx_bytes = 0;
+            }
         }
         tpa_worker_run(worker);
-        if (pool.count > 0) {
+        while (pool.count > 0 && total_send_bytes_left > 0) {
+            tpa_worker_run(worker);
             if (total_send_bytes_left > 0) {
                 struct tpa_iovec *iov = pool_dequeue(&pool);
                 uint8_t *send_ptr = send_data_page + send_offset;
@@ -234,42 +240,44 @@ void run_client(uint16_t port, const char *ip_address) {
                 tx_bytes += iov->iov_len;
                 total_send_bytes_left -= iov->iov_len;
             }
-            if (both_dir && total_recv_bytes_left > 0) {
-                struct tpa_iovec iov;
-                ret = tpa_zreadv(sid, &iov, 1);
-                if (ret <= 0) {
-                    if (ret < 0 && errno == EAGAIN) {
-                        continue;
-                    }
-                    tpa_close(sid);
-                    printf("shutdown conn %s\n", strerror(errno));
-                    return;
-                }
-                rx_bytes += iov.iov_len;
-                total_recv_bytes_left -= iov.iov_len;
-                if (recv_offset + iov.iov_len > DATA_SIZE) {
-                    uint8_t *recv_ptr = recv_data_page + recv_offset;
-                    size_t first_chunk_size = DATA_SIZE - recv_offset;
-                    //memcpy(recv_ptr, iov.iov_base, first_chunk_size);
-                    rte_memcpy(recv_ptr, iov.iov_base, first_chunk_size);
+        }
 
-                    recv_offset = 0;
-                    recv_ptr = recv_data_page + recv_offset;
-                    size_t second_chunk_size = iov.iov_len - first_chunk_size;
-                    //memcpy(recv_ptr, iov.iov_base + first_chunk_size, second_chunk_size);
-                    rte_memcpy(recv_ptr, iov.iov_base + first_chunk_size, second_chunk_size);
-                    recv_offset += second_chunk_size;
-                } else {
-                    uint8_t *recv_ptr = recv_data_page + recv_offset;
-                    //memcpy(recv_ptr, iov.iov_base, iov.iov_len);
-                    rte_memcpy(recv_ptr, iov.iov_base, iov.iov_len);
-                    recv_offset += iov.iov_len;
-                    if (recv_offset == DATA_SIZE) {
-                        recv_offset = 0;
-                    }
+        while (total_recv_bytes_left > 0) {
+            tpa_worker_run(worker);
+            struct tpa_iovec iov;
+            ret = tpa_zreadv(sid, &iov, 1);
+            if (ret <= 0) {
+                if (ret < 0 && errno == EAGAIN) {
+                    break;
                 }
-                iov.iov_read_done(iov.iov_base, iov.iov_param);
+                tpa_close(sid);
+                printf("shutdown conn %s\n", strerror(errno));
+                return;
             }
+            rx_bytes += iov.iov_len;
+            total_recv_bytes_left -= iov.iov_len;
+            if (recv_offset + iov.iov_len > DATA_SIZE) {
+                uint8_t *recv_ptr = recv_data_page + recv_offset;
+                size_t first_chunk_size = DATA_SIZE - recv_offset;
+                memcpy(recv_ptr, iov.iov_base, first_chunk_size);
+                //rte_memcpy(recv_ptr, iov.iov_base, first_chunk_size);
+
+                recv_offset = 0;
+                recv_ptr = recv_data_page + recv_offset;
+                size_t second_chunk_size = iov.iov_len - first_chunk_size;
+                memcpy(recv_ptr, iov.iov_base + first_chunk_size, second_chunk_size);
+                //rte_memcpy(recv_ptr, iov.iov_base + first_chunk_size, second_chunk_size);
+                recv_offset += second_chunk_size;
+            } else {
+                uint8_t *recv_ptr = recv_data_page + recv_offset;
+                memcpy(recv_ptr, iov.iov_base, iov.iov_len);
+                //rte_memcpy(recv_ptr, iov.iov_base, iov.iov_len);
+                recv_offset += iov.iov_len;
+                if (recv_offset == DATA_SIZE) {
+                    recv_offset = 0;
+                }
+            }
+            iov.iov_read_done(iov.iov_base, iov.iov_param);
         }
     }
     while(pool.count != POOL_SIZE) {
