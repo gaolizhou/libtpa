@@ -7,6 +7,7 @@
 #include <sys/mman.h>
 #include <tpa.h>
 #include <time.h>
+#include <rte_memcpy.h>
 
 
 static struct tpa_worker *worker;
@@ -249,15 +250,19 @@ void run_client(uint16_t port, const char *ip_address) {
                 if (recv_offset + iov.iov_len > DATA_SIZE) {
                     uint8_t *recv_ptr = recv_data_page + recv_offset;
                     size_t first_chunk_size = DATA_SIZE - recv_offset;
-                    memcpy(recv_ptr, iov.iov_base, first_chunk_size);
+                    //memcpy(recv_ptr, iov.iov_base, first_chunk_size);
+                    rte_memcpy(recv_ptr, iov.iov_base, first_chunk_size);
+
                     recv_offset = 0;
                     recv_ptr = recv_data_page + recv_offset;
                     size_t second_chunk_size = iov.iov_len - first_chunk_size;
-                    memcpy(recv_ptr, iov.iov_base + first_chunk_size, second_chunk_size);
+                    //memcpy(recv_ptr, iov.iov_base + first_chunk_size, second_chunk_size);
+                    rte_memcpy(recv_ptr, iov.iov_base + first_chunk_size, second_chunk_size);
                     recv_offset += second_chunk_size;
                 } else {
                     uint8_t *recv_ptr = recv_data_page + recv_offset;
-                    memcpy(recv_ptr, iov.iov_base, iov.iov_len);
+                    //memcpy(recv_ptr, iov.iov_base, iov.iov_len);
+                    rte_memcpy(recv_ptr, iov.iov_base, iov.iov_len);
                     recv_offset += iov.iov_len;
                     if (recv_offset == DATA_SIZE) {
                         recv_offset = 0;
